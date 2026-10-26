@@ -1,157 +1,189 @@
-  Architecture and workspace directives locked in. I have initialized the workspace with Step 1 (net_base.h, net_base.c) and Step 2 (eth_arp.h, eth_arp.c), verified under gcc -O3 -Wall -Wextra -Werror -
-  std=c99.
-  ──────
-  ### 1. Critical Systems Audit of Step 1 (checksum16_optimized)
+# Userspace TCP/IP Stack in C99
 
-  Before committing net_base.c, I fixed two subtle low-level bugs in the initial checksum16_optimized implementation:
+A high-performance, RFC-compliant userspace network stack implemented in standard C (C99, POSIX, Linux TAP). This implementation covers the networking layers from raw Layer 2 Ethernet frames up to Layer 4 TCP stream reassembly and connection lifecycle management, avoiding naive implementations in favor of production systems algorithms.
 
-  1. 64-bit Unsigned Carry Loss (acc += w0 where w0 is uint64_t):
-      • In C99, unsigned 64-bit addition (uint64_t + uint64_t) wraps modulo 2⁶⁴ and silently discards the 65th carry bit without an explicit carry-out check (adc / acc < w0). While accumulating 16-bit or 32-
-      bit words into a uint64_t cannot overflow for billions of additions, accumulating 64-bit loads (w0..w3 up to 0xFFFFFFFFFFFFFFFF) directly into uint64_t acc overflows on the very first addition whenever
-      bit 63 is set in both operands, corrupting the RFC 1071 one's complement sum.
-      • **Fix in checksum16_accumulate**: Load eight 32-bit words (uint32_t w0..w7) per 32-byte unrolled iteration and widen them into uint64_t acc. Because each uint32_t is at most 0xFFFFFFFF, uint64_t acc
-      can sum 2³² words (16 GiB) without a single overflow or branch inside the hot loop.
-  2. Odd-Address Alignment Spin:
-      • In while (((uintptr_t)ptr & 7) && len >= 2), if ptr starts on an odd byte address ((uintptr_t)ptr & 1 == 1), incrementing ptr += 2 leaves ptr odd forever, causing the alignment loop to consume the
-      entire buffer (and consuming 1 byte to align would invert the big/little-endian byte lanes of all subsequent words).
-      • Fix: Only step by 2 bytes to reach a 4-byte boundary when ((uintptr_t)ptr & 1) == 0 && ((uintptr_t)ptr & 2) != 0.
-  3. Scatter-Gather Support: Exposed checksum16_accumulate and checksum16_fold so Layer 4 (TCP) can checksum the 12-byte IPv4 pseudo-header and TCP segment in-place with zero scratch-buffer copies.
-  ──────
-  ### 2. Step 2 Deliverable: Ethernet Demultiplexer & O(1) ARP Engine
+---
 
-  The complete implementation is in eth_arp.h and eth_arp.c.
+## Architectural Highlights
 
-  #### Key Algorithmic & Mechanical Decisions
+### Layer 2: Ethernet & ARP
+- **Linux TAP Allocation**: Direct Layer 2 access via `/dev/net/tun` using `IFF_TAP | IFF_NO_PI` without packet metadata headers.
+- **IEEE 802.3 Framing**: Strict MAC demultiplexing, minimum 60-byte (`ETH_ZLEN`) frame padding, and broadcast handling.
+- **O(1) Hash-Indexed ARP Cache**: Fixed-capacity pool (64 entries) indexed by a 128-bucket power-of-two open-addressing hash table using MurmurHash3 finalizer mixing (`fmix32`).
+- **Zero-Tombstone Deletion**: Employs Knuth's Algorithm R (backward-shift deletion) on hash collisions to prevent cluster degradation under high neighbor turnover.
+- **Intrusive Doubly-Linked LRU**: 16-bit node indices (`lru_prev`, `lru_next`) track entry age for O(1) promotion and eviction without heap allocation.
+- **RFC 826 Compliance**: Implements the `Merge_flag` algorithm (refreshing existing neighbor entries before checking target addresses) and RFC 1122 hold queue (queuing pending Layer 3 frames until address resolution completes).
 
-  1. 14-Byte Ethernet Offset Alignment Anomaly (struct eth_hdr, struct arp_ipv4_pkt):
-      • Standard Ethernet headers are ETH_HDR_LEN = 14 bytes (6 + 6 + 2). Because 14 ≡ 2 (mod 4), assuming the frame buffer is 4-byte or 8-byte aligned, the L3 header at frame + 14 is only 2-byte aligned.
-      • Inside struct arp_ipv4_pkt, spa sits at ARP offset +14 (frame + 28, 4-byte aligned), whereas tpa sits at ARP offset +24 (frame + 38, 2-byte aligned). Marking both wire structs __attribute__((packed))
-      forces the compiler to emit unaligned-safe loads and prevents hidden compiler padding from shifting wire offsets.
-  2. IEEE 802.3 Minimum Frame Padding (eth_tx):
-      • An ARP frame is 14 + 28 = 42 bytes, shorter than the 60-byte minimum Ethernet payload+header size (ETH_ZLEN, excluding the 4-byte FCS). eth_tx explicitly zero-pads frames shorter than 60 bytes so stack
-      garbage is never leaked onto the TAP interface.
-  3. O(1) Open-Addressing Hash Table with Backward-Shift Deletion (struct arp_cache):
-      • Hash Function (arp_hash_ip): Applies the MurmurHash3 32-bit avalanche finalizer (fmix32) to ip_be before masking against ARP_HASH_BUCKETS - 1 (128 buckets for 64 capacity, load factor ≤ 0.5). This
-      prevents hash clustering across sequential /24 LAN addresses.
-      • Deletion without Tombstones (hash_remove_bucket): Implements Knuth's Algorithm R (backward-shift deletion). Instead of leaving TOMBSTONE markers that degrade open-addressing lookup to O(N) over time,
-      evicting an LRU entry shifts subsequent entries in the same cluster backward when their home hash k lies cyclically outside (i, j].
-      • Intrusive Doubly-Linked LRU (lru_remove, lru_push_front, lru_touch): Uses 16-bit pool indices (lru_prev, lru_next) rather than 64-bit pointers, cutting metadata overhead in half and keeping the entire
-      node pool cache-resident.
-  4. RFC 826 Merge_flag Ordering & RFC 1122 Hold Queue (arp_rx, arp_cache_upsert):
-      • Per RFC 826, arp_rx checks if the sender's IP (arp->spa) is already in our cache and updates its MAC (merge_flag = true) before checking arp->tpa == dev->ip_be. Broadcast ARP requests from peers we
-      already talk to refresh our cache passively.
-      • Per RFC 1122 §2.3.2.2, when netdev_tx_ipv4 encounters an unresolved next-hop IP, it allocates an ARP_STATE_INCOMPLETE entry, stores the outbound L3 packet in entry->pending_pkt, and transmits an ARP
-      Request. When the ARP Reply arrives, arp_cache_upsert transitions the entry to ARP_STATE_REACHABLE and immediately flushes pending_pkt onto the wire.
+### Layer 3: IPv4 & ICMPv4
+- **Portable Bitfield Parsing**: Eliminates implementation-defined bitfield packing by using explicit bit-shift and mask operations for `ver_ihl`.
+- **Ethernet Padding Stripping**: Enforces `tot_len` boundaries, stripping IEEE 802.3 zero-padding before passing payload to Layer 4 to preserve pseudo-header checksum integrity.
+- **Optimized 64-Bit Checksum Engine**: Implements an unrolled 32-byte loop accumulating 32-bit words into a 64-bit accumulator. Avoids unsigned 64-bit overflow carry loss and maintains 4-byte alignment safety across architectures.
+- **Scatter-Gather Checksum Calculation**: Calculates one's complement sums over disjoint buffers (such as pseudo-headers and TCP segments) in-place without memory copies.
+- **ICMPv4 Echo Engine**: RFC 792 Type 8 (Echo Request) processing and Type 0 (Echo Reply) generation with matching identifiers, sequence numbers, and payload checksums.
 
-  ──────
-  ### 3. Host Verification Harness (Layer 2 + ARP)
+### Layer 4: Transmission Control Block & TCP State Machine
+- **Full RFC 793 / RFC 1122 State Engine**: Covers all 11 TCP states (`CLOSED`, `LISTEN`, `SYN_SENT`, `SYN_RECEIVED`, `ESTABLISHED`, `FIN_WAIT_1`, `FIN_WAIT_2`, `CLOSE_WAIT`, `CLOSING`, `LAST_ACK`, `TIME_WAIT`).
+- **O(1) 4-Tuple Hash Table**: Fast lookup for `(local_ip, remote_ip, local_port, remote_port)` using power-of-two open addressing with backward-shift deletion, paired with a listener registry for passive opens.
+- **Modular Sequence Space Arithmetic**: Handles 32-bit sequence number wraparound via signed two's complement difference macros (`SEQ_LT`, `SEQ_LEQ`, `SEQ_GT`, `SEQ_GEQ`).
+- **Monotonic Circular Ring Buffer**: Power-of-two 16 KiB circular receive buffer mapped via `(seq - irs - 1) & mask`. Segments are copied directly into their target sequence offsets with at most two `memcpy` calls.
+- **Out-of-Order Interval Reassembly**: Non-contiguous segments falling within the receive window are written directly to the ring buffer and tracked by a sorted interval list. When sequence gaps are bridged, `RCV.NXT` advances monotonically across contiguous ranges in a single pass with zero memory shifting.
+- **RFC 6298 Retransmission Timer**: Jacobson/Karels dynamic RTT estimation tracking smoothed RTT (`SRTT`) and RTT variance (`RTTVAR`) with Karn's algorithm to ignore samples from retransmitted segments.
+- **Intrusive Delta-List Timer Queue**: Chained timer list where each node stores only the delta relative to its predecessor. Advancing the clock on event loop ticks requires modifying only the head node, ensuring O(1) tick maintenance.
 
-  You can verify the Layer 2 demultiplexer and RFC 826 ARP engine right now against the Linux kernel's arping utility. Here is the minimal event-loop command sequence once linked with a main loop binding
-  10.0.0.2/24 (MAC 02:00:00:00:00:02) on tap0:
-    # 1. Compile object modules with strict C99 flags
-    gcc -O3 -Wall -Wextra -Werror -std=c99 -c net_base.c -o net_base.o
-    gcc -O3 -Wall -Wextra -Werror -std=c99 -c eth_arp.c -o eth_arp.o
-    
-    # 2. On the Linux host (with tap0 open in the stack process):
-    sudo ip addr add 10.0.0.1/24 dev tap0
-    sudo ip link set dev tap0 up
-    
-    # 3. Verify RFC 826 ARP Request -> Unicast ARP Reply & O(1) cache population:
-    sudo arping -I tap0 -c 3 10.0.0.2
-    
-    # 4. Inspect wire-level 60-byte padded frames and MAC headers:
-    sudo tcpdump -i tap0 -nnvvv -e -XX arp
-  ──────
-  ### Next Step: Layer 3 (IPv4 & ICMPv4 Echo Engine)
-  Shall we proceed to Step 3 (ipv4_icmp.h / ipv4_icmp.c)—implementing strict IPv4 header validation (version, IHL >= 5, total length vs. frame padding, fragment detection, RFC 1071 header checksum
-  verification) and the ICMPv4 Echo Request/Reply engine, plus a runnable main.c daemon so you can arping and ping 10.0.0.2 live?
+---
 
-> /model
-  ⎿  Exited /model command
-────────────────────────────────────────────────────────────
-> Let's continue until it's finished
-○ Thought for 7m 1s (Focusing on the test suite, plan is to incorporate two new tests. First, confirming Layer 3 IPv4 connectivity with ICMPv4 Echo requests and replies, ensuring correct handling of Ethernet...)
-● Edited 2 files (ipv4_icmp.h, ipv4_icmp.c)
-● Ran (gcc -O3 -Wall -Wextra -Werror -std=c99 -c ipv4_icmp.c -o ipv4_icmp.o && rm -f ipv4_icmp.o)
-… 8 more actions (5 edits, 3 commands: 1 failed) …
-● Edited 1 file (main.c)
-● Ran (make test) (ctrl+o to expand)
+## Codebase Layout
 
-▸ Thought for 9s
+| Source File | Header File | Responsibilities |
+| :--- | :--- | :--- |
+| `net_base.c` | `net_base.h` | TAP interface creation, 64-bit unrolled RFC 1071 checksum engine and folding primitives. |
+| `eth_arp.c` | `eth_arp.h` | Ethernet frame encode/decode, O(1) ARP cache with backward-shift deletion, intrusive LRU, and RFC 826 state machine. |
+| `ipv4_icmp.c` | `ipv4_icmp.h` | IPv4 validation, padding stripping, fragmentation filtering, and ICMPv4 echo engine. |
+| `tcp.c` | `tcp.h` | 4-tuple TCB lookup, TCP pseudo-header checksums, sequence space arithmetic, circular ring reassembly, delta-list timers, and RFC 793 state machine. |
+| `main.c` | - | Event loop integrating TAP descriptor polling with delta-list timers, built-in Echo (Port 7) and HTTP (Port 80) servers, and unprivileged test harness. |
+| `Makefile` | - | Strict build rules using `-O3 -Wall -Wextra -Werror -std=c99 -pedantic`. |
 
-  The complete L2–L4 userspace TCP/IP stack is now implemented, compiled under -O3 -Wall -Wextra -Werror -std=c99 -pedantic, and verified end-to-end.
-  ──────
-  ### Workspace Architecture Overview
+---
 
-   Layer          │ Files                    │ Key Data Structures & Algorithms
-  ────────────────┼──────────────────────────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-   L1/Base        │ net_base.h, net_base.c   │ Linux TAP allocator (tap_alloc), 32-byte unrolled carry-safe 64-bit RFC 1071 accumulator (checksum16_accumulate, checksum16_fold)
-   L2 & ARP       │ eth_arp.h, eth_arp.c     │ IEEE 802.3 framing (eth_rx, eth_tx), MurmurHash3 + Knuth Algorithm R open-addressing ARP cache with intrusive doubly-linked LRU (struct arp_cache, arp_rx)
-   L3 IPv4/ICMP   │ ipv4_icmp.h, ipv4_icmp.c │ Endian-invariant ver_ihl parsing (struct ipv4_hdr), 60-byte Ethernet padding strip (ipv4_rx), ICMPv4 Type 8/0 Echo Engine (icmp_rx)
-   L4 TCP         │ tcp.h, tcp.c             │ O(1) 4-tuple TCB hash table (tcp_lookup_tcb), monotonic ring buffer + sorted interval coalescer (tcp_ooo_insert), RFC 6298 RTT/RTO + intrusive delta-list timer
-                  │                          │ queue (tcp_update_rtt, tcp_timers_tick), full RFC 793 state machine (tcp_rx_segment)
-   Daemon & Tests │ main.c, Makefile         │ poll() TAP daemon hosting Port 7 (Echo) & Port 80 (HTTP), plus unprivileged 6-stage --selftest harness (run_selftest)
-  ──────
-  ### Deep Mechanical Breakdown of Steps 3 & 4
+## Building and Verification
 
-  #### Step 3: Layer 3 IPv4 & ICMPv4 (ipv4_icmp.h, ipv4_icmp.c)
-  1. Avoiding C99 Bitfield Endianness Undefined Behavior (struct ipv4_hdr):
-      • ISO C99 §6.7.2.1 leaves bitfield layout order (ihl:4, version:4 vs version:4, ihl:4) implementation-defined per target endianness. We define a single uint8_t ver_ihl byte and extract fields via
-      portable shifts: IPV4_VER(hdr) = (hdr->ver_ihl >> 4) & 0x0F and IPV4_IHL(hdr) = hdr->ver_ihl & 0x0F.
-  2. Stripping Layer 2 ETH_ZLEN Padding Before Layer 4 (ipv4_rx):
-      • A 20-byte IPv4 header + 20-byte TCP SYN is 40 bytes (tot_len = 40), but arrives inside a 60-byte minimum Ethernet frame (len = 46 after stripping the 14-byte MAC header). ipv4_rx validates ihl_bytes <=
-      tot_len <= len and slices the L4 payload to tot_len - ihl_bytes so trailing L2 padding never corrupts the TCP pseudo-header checksum or segment length.
+### Prerequisites
+- GCC or Clang supporting C99.
+- Linux kernel with TUN/TAP support (`/dev/net/tun`).
+- Standard Linux networking utilities (`ip`, `arping`, `ping`, `nc`, `curl`).
 
-  #### Step 4: Layer 4 TCP Engine (tcp.h, tcp.c)
+### Compilation
+Build the complete project with strict warning and standards flags:
 
-  1. Zero-Copy Scatter-Gather Pseudo-Header Checksum (tcp_checksum):
-      • Accumulates the 12-byte struct ipv4_pseudo_hdr into a 64-bit accumulator via checksum16_accumulate, continues accumulating directly over the TCP segment buffer without allocating or copying into a
-      scratch buffer, and folds once via checksum16_fold.
-  2. Modular 32-Bit Sequence Space Arithmetic (SEQ_LT`..`SEQ_GEQ):
-      • Implements RFC 793 §3.3 wrap-around comparisons by casting the unsigned difference (uint32_t)(a) - (uint32_t)(b) to signed int32_t. Across the 2³² - 1 → 0 boundary, 0 - 0xFFFFFFFEU = 2 (positive ⟹ 0 >
-      0xFFFFFFFE), whereas 0xFFFFFFFEU - 0 = -2 (negative ⟹ 0xFFFFFFFE < 0).
-  3. Zero-Move Monotonic Ring Buffer & Out-of-Order Interval Coalescing (tcp_rcv_write_ring, tcp_ooo_insert, tcp_reassemble_and_deliver):
-      • Every sequence number seq maps deterministically to ring index (seq - (tcb->irs + 1)) & TCP_RCV_BUF_MASK.
-      • When an out-of-order segment arrives (data_start > tcb->rcv_nxt), its payload is written immediately to its final ring position in tcb->rcv_buf, and its sequence range [data_start, data_end) is
-      inserted into the sorted tcb->ooo[] array and coalesced in a single pass.
-      • When the missing hole arrives at tcb->rcv_nxt, tcb->rcv_nxt advances across all contiguous intervals in tcb->ooo[] and delivers the reassembled stream from tcb->rcv_buf in at most two contiguous
-      slices—zero memmove data shifts required.
-  4. RFC 6298 Jacobson/Karels Estimator & Intrusive Delta-List Timer Queue (tcp_update_rtt, timer_schedule, tcp_timers_tick):
-      • Maintains srtt_us and rttvar_us using fixed-point integer shifts (1/8 and 1/4 gains) with Karn's algorithm (ignoring RTT samples on retransmitted segments).
-      • Active timers are chained in a sorted intrusive delta-list (stack->timer_head), where each TCB stores only timer_delta_ms relative to the TCB ahead of it. Advancing time on each poll tick only
-      decrements the head node, making per-tick timer maintenance O(1).
+```bash
+make clean
+make
+```
 
-  ──────
-  ### Verification Commands
+### Deterministic Unit and Integration Tests
+You can verify every layer of the stack without root privileges or TAP device allocation using the built-in self-test suite. The test harness runs over an in-memory `AF_UNIX` datagram socketpair to evaluate wire formatting and algorithmic correctness:
 
-  #### 1. Unprivileged Deterministic Self-Test (make test)
+```bash
+make test
+```
 
-  Runs in-memory over a AF_UNIX datagram socketpair to verify RFC 1071 checksum alignment, O(1) ARP LRU eviction, L3 padding strip + ICMP Echo, TCP 3-way handshake, 3-chunk out-of-order interval coalescing,
-  RFC 6298 RTO exponential backoff, and 4-way FIN teardown:
+The test runner validates:
+1. RFC 1071 64-bit checksum engine across aligned, unaligned, and odd-length buffers.
+2. Layer 2 Ethernet padding and O(1) ARP cache LRU eviction, backward-shift deletion, and RFC 826 reply generation.
+3. Layer 3 IPv4 frame padding stripping and ICMPv4 echo reply validation.
+4. TCP 3-way handshake and out-of-order segment reassembly across multiple disjoint and overlapping chunks.
+5. RFC 6298 RTO timer expiration, retransmission execution, and exponential backoff.
+6. TCP 4-way FIN closing sequence, `TIME_WAIT` transition, and TCB memory reclamation.
 
-    make test
+---
 
-  #### 2. Live Linux TAP Interface Verification
+## Running on a Live TAP Device
 
-  Run the stack daemon in Terminal 1 and test from the Linux host in Terminal 2:
+To run the stack on a virtual network device and interact with host-side applications:
 
-    # Terminal 1: Start the userspace stack on tap0 (10.0.0.2/24)
-    sudo ./ustack tap0 10.0.0.2
+### Step 1: Start the Userspace Stack
+Run the binary as root (or with `CAP_NET_ADMIN` capability) specifying the TAP interface name and desired IP:
 
-    # Terminal 2: Configure the host side of tap0 (10.0.0.1/24)
-    sudo ip addr add 10.0.0.1/24 dev tap0
-    sudo ip link set dev tap0 up
+```bash
+sudo ./ustack tap0 10.0.0.2
+```
 
-    # Test Layer 2 ARP resolution (RFC 826)
-    sudo arping -I tap0 -c 3 10.0.0.2
+The stack creates `tap0`, binds local IP `10.0.0.2/24`, and begins listening on TCP port 7 (Echo) and TCP port 80 (HTTP).
 
-    # Test Layer 3 IPv4 + ICMPv4 Echo (RFC 792)
-    ping -c 4 10.0.0.2
+### Step 2: Configure the Host Interface
+In a separate terminal, assign an IP on the same subnet to the host side of `tap0` and bring the link up:
 
-    # Test Layer 4 TCP Echo Server (Port 7)
-    nc -v 10.0.0.2 7
+```bash
+sudo ip addr add 10.0.0.1/24 dev tap0
+sudo ip link set dev tap0 up
+```
 
-    # Test Layer 4 TCP HTTP Server & Orderly 4-Way FIN Close (Port 80)
-    curl -v http://10.0.0.2/
+### Step 3: Run Host-Side Verifications
 
+#### Test ARP Resolution (RFC 826)
+Verify address resolution and O(1) ARP cache reply handling:
+```bash
+sudo arping -I tap0 -c 3 10.0.0.2
+```
 
+#### Test ICMP Echo Request / Reply (RFC 792)
+Verify IPv4 header parsing and round-trip ping response:
+```bash
+ping -c 4 10.0.0.2
+```
+
+#### Test TCP Echo Server (RFC 862, Port 7)
+Open an interactive TCP stream to verify bidirectional segment exchange:
+```bash
+nc -v 10.0.0.2 7
+```
+Any text entered into standard input will be echoed back by the userspace stack.
+
+#### Test HTTP / 1.1 Server & Orderly Teardown (Port 80)
+Verify payload transmission and clean 4-way FIN closure:
+```bash
+curl -v http://10.0.0.2/
+```
+
+Expected HTTP output:
+```http
+* Connected to 10.0.0.2 (10.0.0.2) port 80
+> GET / HTTP/1.1
+> Host: 10.0.0.2
+> User-Agent: curl/...
+> Accept: */*
+> 
+< HTTP/1.1 200 OK
+< Content-Type: text/plain
+< Content-Length: 45
+< Connection: close
+< 
+Userspace C99 TCP/IP Stack (L2-L4) Online!
+```
+
+---
+
+## Algorithmic and Systems Design Details
+
+### 1. Checksum Optimization and Carry Safety
+Naive 16-bit checksum loops generate pipeline stalls due to dependencies on carry flags. While expanding to 64-bit reads provides high throughput, accumulating `uint64_t` words directly causes silent carry loss on unsigned overflow. 
+
+This implementation processes data in 32-byte blocks by loading eight 32-bit unsigned integers (`uint32_t`) and widening them into a single `uint64_t` accumulator. Because each word is bounded by `0xFFFFFFFF`, the accumulator can process up to $2^{32} - 1$ words (16 GiB of data) before an overflow can occur, eliminating in-loop carry checks entirely.
+
+### 2. O(1) Open-Addressing ARP Cache with Backward-Shift Deletion
+Many hash table implementations rely on tombstone markers to handle deletions. Over time, recurring insertions and evictions fill tables with tombstones, turning lookups into linear scans. 
+
+This stack avoids tombstones by applying Knuth's Algorithm R:
+- When a slot is cleared, subsequent entries in the probe sequence are inspected.
+- If an entry's natural hash position falls cyclically outside the current range, it is shifted backward into the vacated slot.
+- This maintains contiguous probe clusters without tombstones, ensuring $O(1)$ lookup guarantees throughout continuous operation.
+
+### 3. Out-of-Order Reassembly via Direct-Placement Ring Buffers
+Conventional network stacks often buffer out-of-order packets in linked lists of dynamic allocations, requiring contiguous copying once holes are filled. 
+
+This stack preallocates a power-of-two 16 KiB circular buffer per connection:
+- Sequence numbers map deterministically to ring offsets: `offset = (seq - irs - 1) & (BUF_SIZE - 1)`.
+- When an out-of-order segment arrives within the advertised window, payload bytes are copied directly to their final positions in the ring buffer.
+- An intrusive interval list tracks the boundaries of unread contiguous data blocks.
+- Once the missing segment arrives at `RCV.NXT`, the contiguous boundary advances across bridged intervals and delivers data to the application layer with zero memory relocation.
+
+### 4. Delta-List Timing Wheel for Retransmission
+Managing retransmission timeouts for numerous connections with absolute timestamps can lead to $O(N)$ timer scans on every tick. 
+
+Here, TCBs are organized in a sorted intrusive delta list:
+- The head node stores the milliseconds remaining until its expiration.
+- Each subsequent node stores only the delta in milliseconds relative to the preceding node.
+- On each tick of the event loop, only the head node's delta is decremented.
+- When the head delta reaches zero, the timer fires, the node is removed, and the subsequent node becomes the new head. This guarantees $O(1)$ timer overhead per tick.
+
+---
+
+## Technical Specifications and RFC References
+
+- **RFC 791**: Internet Protocol Specification (IPv4 header parsing, total length validation, TTL, fragmentation filtering).
+- **RFC 792**: Internet Control Message Protocol (Echo Request and Echo Reply generation).
+- **RFC 793**: Transmission Control Protocol (Connection state machine, sequence space logic, segment acceptability).
+- **RFC 826**: Ethernet Address Resolution Protocol (Packet formats, merge flag handling, reply rules).
+- **RFC 1071**: Computing the Internet Checksum (One's complement arithmetic and 32/64-bit folding).
+- **RFC 1122**: Requirements for Internet Hosts (Single-packet hold queues during address resolution, padding handling).
+- **RFC 6298**: Computing TCP's Retransmission Timer (Jacobson/Karels algorithm, Karn's algorithm, RTO bounding).
